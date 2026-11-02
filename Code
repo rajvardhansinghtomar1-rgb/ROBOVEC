@@ -1,0 +1,93 @@
+#include <Wire.h>
+#include <VL53L0X.h>
+
+// ---------- settings ----------
+const bool  USE_HOME_SWITCH = false;   // set true once you add a limit switch / hall sensor
+const int   HOME_PIN        = 4;
+const float ANGLE_STEP_DEG  = 2.0;     // angular resolution of the scan
+const int   MAX_RANGE_MM    = 2000;    // readings above this are treated as invalid
+const int   STEP_DELAY_US   = 1500;    // motor speed (raise if it skips steps)
+const int   SETTLE_MS       = 15;      // let vibration die down before measuring
+const float STEPS_PER_REV   = 4075.77; // 28BYJ-48 half-step mode, real gear ratio
+
+// ---------- motor ----------
+const int coilPins[4] = {19, 18, 5, 17};
+const uint8_t seq[8][4] = {
+  {1,0,0,0},{1,1,0,0},{0,1,0,0},{0,1,1,0},
+  {0,0,1,0},{0,0,1,1},{0,0,0,1},{1,0,0,1}
+};
+int phase = 0;
+long stepPos = 0;                      // current position in half-steps, 0 = home
+
+void setCoils(int p) {
+  for (int i = 0; i < 4; i++) digitalWrite(coilPins[i], seq[p][i]);
+}
+void releaseCoils() {
+  for (int i = 0; i < 4; i++) digitalWrite(coilPins[i], LOW);
+}
+void stepOnce(int dir) {               // +1 clockwise, -1 anticlockwise
+  phase = (phase + dir + 8) % 8;
+  setCoils(phase);
+  stepPos += dir;
+  delayMicroseconds(STEP_DELAY_US);
+}
+void moveTo(long target) {
+  while (stepPos < target) stepOnce(+1);
+  while (stepPos > target) stepOnce(-1);
+}
+
+// ---------- sensor ----------
+VL53L0X sensor;
+
+int readDistanceMM() {
+  uint16_t d = sensor.readRangeSingleMillimeters();
+  if (sensor.timeoutOccurred() || d > MAX_RANGE_MM) return -1;
+  return d;
+}
+
+// ---------- homing ----------
+void homeIfNeeded() {
+  if (USE_HOME_SWITCH) {
+    pinMode(HOME_PIN, INPUT_PULLUP);
+    long guard = (long)(STEPS_PER_REV * 1.1);
+    while (digitalRead(HOME_PIN) == HIGH && guard-- > 0) stepOnce(-1);  // search anticlockwise
+  }
+  stepPos = 0;                         // this position is now 0 degrees
+}
+
+void setup() {
+  Serial.begin(115200);
+  for (int i = 0; i < 4; i++) pinMode(coilPins[i], OUTPUT);
+  releaseCoils();
+
+  Wire.begin(21, 22);
+  sensor.setTimeout(500);
+  if (!sensor.init()) {
+    Serial.println("VL53L0X not found - check wiring");
+    while (true) delay(1000);
+  }
+  sensor.setMeasurementTimingBudget(20000);   // 20 ms: faster, fine for short range
+
+  homeIfNeeded();
+  delay(500);
+}
+
+void loop() {
+  Serial.println("SCAN_START");
+
+  int samples = (int)(360.0 / ANGLE_STEP_DEG);
+  for (int i = 0; i < samples; i++) {
+    float angle = i * ANGLE_STEP_DEG;
+    moveTo(lround(angle * STEPS_PER_REV / 360.0));
+    delay(SETTLE_MS);
+    Serial.print(angle, 1);
+    Serial.print(",");
+    Serial.println(readDistanceMM());
+  }
+
+  Serial.println("SCAN_END");
+
+  moveTo(0);                           // unwind anticlockwise, no measuring
+  releaseCoils();
+  delay(1000);
+}
